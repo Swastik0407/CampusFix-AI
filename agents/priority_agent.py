@@ -1,96 +1,219 @@
 
 import json
+import os
+import re
 import time
 
-from google import genai
-from google.genai import types
+from dotenv import load_dotenv
+from openai import (
+    OpenAI,
+    APIConnectionError,
+    APITimeoutError,
+    RateLimitError,
+    InternalServerError,
+    APIStatusError
+)
 
-from config.settings import GEMINI_API_KEY, GEMINI_MODEL
+# Load environment variables
+load_dotenv()
+
+NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
+
+NVIDIA_MODEL = os.getenv(
+    "NVIDIA_MODEL",
+    "nvidia/nemotron-3.5-bolt-e4b"
+)
+
+NVIDIA_BASE_URL = os.getenv(
+    "NVIDIA_BASE_URL",
+    "https://integrate.api.nvidia.com/v1"
+)
 
 
 def assess_priority(description: str, category: str, location: str):
 
-    if not GEMINI_API_KEY:
+    # Check NVIDIA API key
+    if not NVIDIA_API_KEY:
         return {
             "success": False,
             "agent": "Priority Agent",
-            "error": "Gemini API key is missing."
+            "error": "NVIDIA API key is missing."
+        }
+
+    if not isinstance(description, str) or not description.strip():
+        return {
+            "success": False,
+            "agent": "Priority Agent",
+            "error": "Complaint description cannot be empty."
+        }
+
+    if not isinstance(category, str) or not category.strip():
+        return {
+            "success": False,
+            "agent": "Priority Agent",
+            "error": "Complaint category cannot be empty."
+        }
+
+    if not isinstance(location, str) or not location.strip():
+        return {
+            "success": False,
+            "agent": "Priority Agent",
+            "error": "Complaint location cannot be empty."
         }
 
     try:
-        client = genai.Client(api_key=GEMINI_API_KEY)
+
+        # Initialize NVIDIA client
+        client = OpenAI(
+            base_url=NVIDIA_BASE_URL,
+            api_key=NVIDIA_API_KEY,
+            timeout=45.0,
+            max_retries=0
+        )
 
         prompt = f"""
-        You are the Priority Assessment Agent of CampusFix AI.
+You are the Priority Assessment Agent of CampusFix AI.
 
-        Assess the urgency of the following campus complaint.
+Assess the urgency of the following campus complaint.
 
-        Complaint: {description}
-        Category: {category}
-        Location: {location}
+Complaint: {description}
+Category: {category}
+Location: {location}
 
-        Classify the priority as:
+Classify the priority as:
 
-        - High: Immediate safety risk or serious disruption.
-        - Medium: Important issue affecting normal campus activities.
-        - Low: Minor issue that can wait.
+- High: Immediate safety risk or serious disruption.
+- Medium: Important issue affecting normal campus activities.
+- Low: Minor issue that can wait.
 
-        Return ONLY valid JSON in this format:
+Return ONLY valid JSON in this exact format:
 
-        {{
-            "priority": "High / Medium / Low",
-            "urgency_reason": "Explain why this priority was assigned",
-            "recommended_action": "What should be done next"
-        }}
+{{
+    "priority": "High",
+    "urgency_reason": "Explain why this priority was assigned",
+    "recommended_action": "What should be done next"
+}}
 
-        Rules:
-        - Never invent facts.
-        - Prioritize safety.
-        - Do not classify every complaint as High.
-        - Keep explanations concise.
-        """
+Rules:
+- Never invent facts.
+- Prioritize safety.
+- Do not classify every complaint as High.
+- Keep explanations concise.
+- Select exactly one priority: High, Medium, or Low.
+- Return valid JSON only without Markdown.
+"""
 
-        # Retry Gemini API for temporary service errors.
         response = None
 
+        # Retry NVIDIA API for temporary errors
         for attempt in range(3):
+
             try:
+
                 print(
-                    f"[Priority Agent] Gemini API attempt {attempt + 1}/3",
+                    f"[Priority Agent] NVIDIA API attempt "
+                    f"{attempt + 1}/3",
                     flush=True
                 )
 
-                response = client.models.generate_content(
-                    model=GEMINI_MODEL,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json"
-                    )
+                response = client.chat.completions.create(
+                    model=NVIDIA_MODEL,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": (
+                                "You are CampusFix AI's Priority "
+                                "Assessment Agent. Assess complaint "
+                                "urgency accurately and return "
+                                "only valid JSON."
+                            )
+                        },
+                        {
+                            "role": "user",
+                            "content": prompt
+                        }
+                    ],
+                    temperature=0.1,
+                    max_tokens=500
                 )
 
                 break
 
-            except Exception as e:
-                error_message = str(e)
+            except (
+                APIConnectionError,
+                APITimeoutError,
+                RateLimitError,
+                InternalServerError
+            ) as e:
 
-                if "503" in error_message or "UNAVAILABLE" in error_message:
+                print(
+                    f"[Priority Agent] Temporary NVIDIA API error: {e}",
+                    flush=True
+                )
+
+                if attempt == 2:
+                    raise
+
+                wait_time = 3 * (attempt + 1)
+                time.sleep(wait_time)
+
+            except APIStatusError as e:
+
+                if e.status_code == 429 or e.status_code >= 500:
+
                     print(
-                        "[Priority Agent] Gemini temporarily unavailable.",
+                        f"[Priority Agent] NVIDIA API status: "
+                        f"{e.status_code}",
                         flush=True
                     )
 
-                    if attempt < 2:
-                        time.sleep(3 * (attempt + 1))
-                    else:
+                    if attempt == 2:
                         raise
+
+                    time.sleep(3 * (attempt + 1))
+
                 else:
                     raise
 
-        if not response or not response.text:
-            raise ValueError("Gemini returned an empty response.")
+        # Validate response
+        if not response or not response.choices:
+            raise ValueError("NVIDIA returned an empty response.")
 
-        result = json.loads(response.text)
+        response_text = response.choices[0].message.content
 
+        if not response_text:
+            raise ValueError("NVIDIA returned empty response content.")
+
+        # Remove Markdown code fences
+        response_text = response_text.strip()
+
+        response_text = re.sub(
+            r"^```(?:json)?\s*",
+            "",
+            response_text,
+            flags=re.IGNORECASE
+        )
+
+        response_text = re.sub(
+            r"\s*```$",
+            "",
+            response_text
+        )
+
+        # Extract JSON object
+        json_start = response_text.find("{")
+
+        if json_start == -1:
+            raise ValueError("No JSON object found in NVIDIA response.")
+
+        result, _ = json.JSONDecoder().raw_decode(
+            response_text[json_start:]
+        )
+
+        if not isinstance(result, dict):
+            raise ValueError("NVIDIA response is not a JSON object.")
+
+        # Validate required fields
         required_fields = [
             "priority",
             "urgency_reason",
@@ -98,18 +221,28 @@ def assess_priority(description: str, category: str, location: str):
         ]
 
         for field in required_fields:
-            if (
-                field not in result
-                or not isinstance(result[field], str)
-                or not result[field].strip()
-            ):
-                raise ValueError(f"Missing or invalid field: {field}")
 
+            value = result.get(field)
+
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(
+                    f"Missing or invalid field: {field}"
+                )
+
+            result[field] = value.strip()
+
+        # Validate priority
         if result["priority"] not in ["High", "Medium", "Low"]:
-            raise ValueError("Invalid priority returned by AI.")
+            raise ValueError(
+                f"Invalid priority: {result['priority']}"
+            )
 
-        print("[Priority Agent] Assessment completed successfully.", flush=True)
+        print(
+            "[Priority Agent] NVIDIA assessment completed successfully.",
+            flush=True
+        )
 
+        # Preserve original return structure
         return {
             "success": True,
             "agent": "Priority Agent",
@@ -117,6 +250,7 @@ def assess_priority(description: str, category: str, location: str):
         }
 
     except Exception as e:
+
         print(
             f"[Priority Agent ERROR] {type(e).__name__}: {e}",
             flush=True

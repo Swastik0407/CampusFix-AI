@@ -1,101 +1,228 @@
 
 import json
+import os
+import re
 import time
 
-from google import genai
-from google.genai import types
+from dotenv import load_dotenv
+from openai import (
+    OpenAI,
+    APIConnectionError,
+    APITimeoutError,
+    RateLimitError,
+    InternalServerError,
+    APIStatusError
+)
 
-from config.settings import GEMINI_API_KEY, GEMINI_MODEL
+# Load environment variables
+load_dotenv()
+
+NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
+
+NVIDIA_MODEL = os.getenv(
+    "NVIDIA_MODEL",
+    "nvidia/nemotron-3.5-bolt-e4b"
+)
+
+NVIDIA_BASE_URL = os.getenv(
+    "NVIDIA_BASE_URL",
+    "https://integrate.api.nvidia.com/v1"
+)
+
+
+# Allowed departments
+ALLOWED_DEPARTMENTS = [
+    "Maintenance",
+    "Electrical",
+    "Plumbing",
+    "IT Support",
+    "Sanitation",
+    "Security",
+    "Administration"
+]
 
 
 def route_complaint(description: str, category: str, priority: str):
 
-    if not GEMINI_API_KEY:
+    # Check NVIDIA API key
+    if not NVIDIA_API_KEY:
         return {
             "success": False,
             "agent": "Routing Agent",
-            "error": "Gemini API key is missing."
+            "error": "NVIDIA API key is missing."
+        }
+
+    if not isinstance(description, str) or not description.strip():
+        return {
+            "success": False,
+            "agent": "Routing Agent",
+            "error": "Complaint description cannot be empty."
+        }
+
+    if not isinstance(category, str) or not category.strip():
+        return {
+            "success": False,
+            "agent": "Routing Agent",
+            "error": "Complaint category cannot be empty."
+        }
+
+    if priority not in ["High", "Medium", "Low"]:
+        return {
+            "success": False,
+            "agent": "Routing Agent",
+            "error": "Invalid complaint priority."
         }
 
     try:
-        client = genai.Client(api_key=GEMINI_API_KEY)
+
+        # Initialize NVIDIA client
+        client = OpenAI(
+            base_url=NVIDIA_BASE_URL,
+            api_key=NVIDIA_API_KEY,
+            timeout=45.0,
+            max_retries=0
+        )
 
         prompt = f"""
-        You are the Department Routing Agent of CampusFix AI.
+You are the Department Routing Agent of CampusFix AI.
 
-        Your job is to route campus complaints to the appropriate department.
+Your job is to route campus complaints to the appropriate department.
 
-        Complaint: {description}
-        Category: {category}
-        Priority: {priority}
+Complaint: {description}
+Category: {category}
+Priority: {priority}
 
-        Choose the most appropriate department from:
+Choose the most appropriate department from:
 
-        - Maintenance
-        - Electrical
-        - Plumbing
-        - IT Support
-        - Sanitation
-        - Security
-        - Administration
+{", ".join(ALLOWED_DEPARTMENTS)}
 
-        Return ONLY valid JSON in this format:
+Return ONLY valid JSON in this exact format:
 
-        {{
-            "department": "Department name",
-            "routing_reason": "Why this department was selected",
-            "recommended_team": "Team responsible for handling the issue"
-        }}
+{{
+    "department": "Maintenance",
+    "routing_reason": "Why this department was selected",
+    "recommended_team": "Team responsible for handling the issue"
+}}
 
-        Rules:
-        - Select only from the listed departments.
-        - Use the complaint category and description.
-        - Do not invent information.
-        - Consider priority when recommending the response.
-        - Keep explanations concise.
-        """
+Rules:
+- Select only from the listed departments.
+- Use the complaint category and description.
+- Do not invent information.
+- Consider priority when recommending the response.
+- Keep explanations concise.
+- Return valid JSON only without Markdown.
+"""
 
-        # Retry Gemini API for temporary service errors.
         response = None
 
+        # Retry NVIDIA API for temporary errors
         for attempt in range(3):
+
             try:
+
                 print(
-                    f"[Routing Agent] Gemini API attempt {attempt + 1}/3",
+                    f"[Routing Agent] NVIDIA API attempt "
+                    f"{attempt + 1}/3",
                     flush=True
                 )
 
-                response = client.models.generate_content(
-                    model=GEMINI_MODEL,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json"
-                    )
+                response = client.chat.completions.create(
+                    model=NVIDIA_MODEL,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": (
+                                "You are CampusFix AI's Department "
+                                "Routing Agent. Route campus complaints "
+                                "accurately and return only valid JSON."
+                            )
+                        },
+                        {
+                            "role": "user",
+                            "content": prompt
+                        }
+                    ],
+                    temperature=0.1,
+                    max_tokens=500
                 )
 
                 break
 
-            except Exception as e:
-                error_message = str(e)
+            except (
+                APIConnectionError,
+                APITimeoutError,
+                RateLimitError,
+                InternalServerError
+            ) as e:
 
-                if "503" in error_message or "UNAVAILABLE" in error_message:
+                print(
+                    f"[Routing Agent] Temporary NVIDIA API error: {e}",
+                    flush=True
+                )
+
+                if attempt == 2:
+                    raise
+
+                wait_time = 3 * (attempt + 1)
+                time.sleep(wait_time)
+
+            except APIStatusError as e:
+
+                if e.status_code == 429 or e.status_code >= 500:
+
                     print(
-                        "[Routing Agent] Gemini temporarily unavailable.",
+                        f"[Routing Agent] NVIDIA API status: "
+                        f"{e.status_code}",
                         flush=True
                     )
 
-                    if attempt < 2:
-                        time.sleep(3 * (attempt + 1))
-                    else:
+                    if attempt == 2:
                         raise
+
+                    time.sleep(3 * (attempt + 1))
+
                 else:
                     raise
 
-        if not response or not response.text:
-            raise ValueError("Gemini returned an empty response.")
+        # Validate NVIDIA response
+        if not response or not response.choices:
+            raise ValueError("NVIDIA returned an empty response.")
 
-        result = json.loads(response.text)
+        response_text = response.choices[0].message.content
 
+        if not response_text:
+            raise ValueError("NVIDIA returned empty response content.")
+
+        # Remove Markdown code fences
+        response_text = response_text.strip()
+
+        response_text = re.sub(
+            r"^```(?:json)?\s*",
+            "",
+            response_text,
+            flags=re.IGNORECASE
+        )
+
+        response_text = re.sub(
+            r"\s*```$",
+            "",
+            response_text
+        )
+
+        # Extract JSON object
+        json_start = response_text.find("{")
+
+        if json_start == -1:
+            raise ValueError("No JSON object found in NVIDIA response.")
+
+        result, _ = json.JSONDecoder().raw_decode(
+            response_text[json_start:]
+        )
+
+        if not isinstance(result, dict):
+            raise ValueError("NVIDIA response is not a JSON object.")
+
+        # Validate required fields
         required_fields = [
             "department",
             "routing_reason",
@@ -103,30 +230,28 @@ def route_complaint(description: str, category: str, priority: str):
         ]
 
         for field in required_fields:
-            if (
-                field not in result
-                or not isinstance(result[field], str)
-                or not result[field].strip()
-            ):
-                raise ValueError(f"Missing or invalid field: {field}")
 
-        allowed_departments = [
-            "Maintenance",
-            "Electrical",
-            "Plumbing",
-            "IT Support",
-            "Sanitation",
-            "Security",
-            "Administration"
-        ]
+            value = result.get(field)
 
-        if result["department"] not in allowed_departments:
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(
+                    f"Missing or invalid field: {field}"
+                )
+
+            result[field] = value.strip()
+
+        # Validate department
+        if result["department"] not in ALLOWED_DEPARTMENTS:
             raise ValueError(
                 f"Invalid department: {result['department']}"
             )
 
-        print("[Routing Agent] Routing completed successfully.", flush=True)
+        print(
+            "[Routing Agent] NVIDIA routing completed successfully.",
+            flush=True
+        )
 
+        # Preserve original return structure
         return {
             "success": True,
             "agent": "Routing Agent",
@@ -134,6 +259,7 @@ def route_complaint(description: str, category: str, priority: str):
         }
 
     except Exception as e:
+
         print(
             f"[Routing Agent ERROR] {type(e).__name__}: {e}",
             flush=True

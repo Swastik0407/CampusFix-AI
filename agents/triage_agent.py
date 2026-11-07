@@ -1,115 +1,219 @@
 
 import json
+import os
+import re
 import time
 
-from google import genai
-from google.genai import types
+from dotenv import load_dotenv
+from openai import (
+    OpenAI,
+    APIConnectionError,
+    APITimeoutError,
+    RateLimitError,
+    InternalServerError,
+    APIStatusError
+)
 
-from config.settings import GEMINI_API_KEY, GEMINI_MODEL
+# Load environment variables
+load_dotenv()
+
+NVIDIA_API_KEY = os.getenv("NVIDIA_API_KEY")
+
+NVIDIA_MODEL = os.getenv(
+    "NVIDIA_MODEL",
+    "nvidia/nemotron-3.5-bolt-e4b"
+)
+
+NVIDIA_BASE_URL = os.getenv(
+    "NVIDIA_BASE_URL",
+    "https://integrate.api.nvidia.com/v1"
+)
+
+
+# Allowed complaint categories
+ALLOWED_CATEGORIES = [
+    "Plumbing",
+    "Electrical",
+    "IT Support",
+    "Sanitation",
+    "Security",
+    "Maintenance",
+    "Administration",
+    "Other"
+]
 
 
 def analyze_complaint(description: str, location: str):
 
-    if not GEMINI_API_KEY:
+    if not NVIDIA_API_KEY:
         return {
             "success": False,
             "agent": "Triage Agent",
-            "error": "Gemini API key is missing."
+            "error": "NVIDIA API key is missing."
+        }
+
+    if not isinstance(description, str) or not description.strip():
+        return {
+            "success": False,
+            "agent": "Triage Agent",
+            "error": "Complaint description cannot be empty."
+        }
+
+    if not isinstance(location, str) or not location.strip():
+        return {
+            "success": False,
+            "agent": "Triage Agent",
+            "error": "Complaint location cannot be empty."
         }
 
     try:
-        client = genai.Client(api_key=GEMINI_API_KEY)
+
+        client = OpenAI(
+            base_url=NVIDIA_BASE_URL,
+            api_key=NVIDIA_API_KEY,
+            timeout=45.0,
+            max_retries=0
+        )
 
         prompt = f"""
-        You are the Triage Agent of CampusFix AI.
+You are the Triage Agent of CampusFix AI.
 
-        Your job is to understand and classify campus complaints.
+Analyze the following campus complaint.
 
-        Analyze the following complaint:
+Complaint: {description}
+Location: {location}
 
-        Complaint: {description}
-        Location: {location}
+Identify:
+1. Complaint category.
+2. Short issue summary.
+3. Exact location.
+4. Specific issue type.
 
-        Identify:
-        1. The complaint category.
-        2. A clear summary of the issue.
-        3. The exact location.
-        4. The specific type of issue.
+Allowed categories:
+{", ".join(ALLOWED_CATEGORIES)}
 
-        Select the category from:
-        - Plumbing
-        - Electrical
-        - IT Support
-        - Sanitation
-        - Security
-        - Maintenance
-        - Administration
-        - Other
+Return ONLY valid JSON in this format:
 
-        Return ONLY valid JSON in this format:
+{{
+    "category": "Plumbing",
+    "issue_summary": "Water pipe leakage",
+    "location": "Boys Hostel",
+    "issue_type": "Water leakage"
+}}
 
-        {{
-            "category": "Category name",
-            "issue_summary": "Short summary of the complaint",
-            "location": "Complaint location",
-            "issue_type": "Specific issue type"
-        }}
+Rules:
+- Select exactly one allowed category.
+- Do not invent information.
+- Keep the summary concise.
+- Use only the provided complaint details.
+- Preserve the supplied location exactly.
+- Return valid JSON without Markdown.
+"""
 
-        Rules:
-        - Do not invent information.
-        - Keep the summary concise.
-        - Use only the provided complaint details.
-        - Return valid JSON only.
-        """
-
-        # Retry Gemini API if the service is temporarily unavailable.
         response = None
 
+        # Retry temporarily failed API requests
         for attempt in range(3):
 
             try:
+
                 print(
-                    f"[Triage Agent] Gemini API attempt {attempt + 1}/3",
+                    f"[Triage Agent] NVIDIA API attempt "
+                    f"{attempt + 1}/3",
                     flush=True
                 )
 
-                response = client.models.generate_content(
-                    model=GEMINI_MODEL,
-                    contents=prompt,
-                    config=types.GenerateContentConfig(
-                        response_mime_type="application/json"
-                    )
+                response = client.chat.completions.create(
+                    model=NVIDIA_MODEL,
+                    messages=[
+                        {
+                            "role": "system",
+                            "content": (
+                                "You are CampusFix AI's Triage Agent. "
+                                "Analyze campus complaints and return "
+                                "only valid JSON."
+                            )
+                        },
+                        {
+                            "role": "user",
+                            "content": prompt
+                        }
+                    ],
+                    temperature=0.1,
+                    max_tokens=500
                 )
 
                 break
 
-            except Exception as e:
+            except (
+                APIConnectionError,
+                APITimeoutError,
+                RateLimitError,
+                InternalServerError
+            ) as e:
 
-                error_message = str(e)
+                print(
+                    f"[Triage Agent] Temporary API error: {e}",
+                    flush=True
+                )
 
-                if "503" in error_message or "UNAVAILABLE" in error_message:
+                if attempt == 2:
+                    raise
 
-                    print(
-                        f"[Triage Agent] Gemini temporarily unavailable. "
-                        f"Retrying...",
-                        flush=True
-                    )
+                wait_time = 3 * (attempt + 1)
+                time.sleep(wait_time)
 
-                    if attempt < 2:
-                        time.sleep(3 * (attempt + 1))
-                    else:
+            except APIStatusError as e:
+
+                if e.status_code == 429 or e.status_code >= 500:
+
+                    if attempt == 2:
                         raise
+
+                    time.sleep(3 * (attempt + 1))
 
                 else:
                     raise
 
-        # Parse Gemini response.
-        if not response or not response.text:
-            raise ValueError("Gemini returned an empty response.")
+        # Validate API response
+        if not response or not response.choices:
+            raise ValueError("NVIDIA returned an empty response.")
 
-        result = json.loads(response.text)
+        response_text = response.choices[0].message.content
 
-        # Validate required fields.
+        if not response_text:
+            raise ValueError("NVIDIA returned empty response content.")
+
+        # Remove Markdown code fences
+        response_text = response_text.strip()
+
+        response_text = re.sub(
+            r"^```(?:json)?\s*",
+            "",
+            response_text,
+            flags=re.IGNORECASE
+        )
+
+        response_text = re.sub(
+            r"\s*```$",
+            "",
+            response_text
+        )
+
+        # Extract JSON
+        json_start = response_text.find("{")
+
+        if json_start == -1:
+            raise ValueError("No JSON object found in NVIDIA response.")
+
+        result, _ = json.JSONDecoder().raw_decode(
+            response_text[json_start:]
+        )
+
+        if not isinstance(result, dict):
+            raise ValueError("Invalid JSON object.")
+
+        # Validate required fields
         required_fields = [
             "category",
             "issue_summary",
@@ -118,26 +222,29 @@ def analyze_complaint(description: str, location: str):
         ]
 
         for field in required_fields:
-            if field not in result or not isinstance(result[field], str) or not result[field].strip():
-                raise ValueError(f"Missing or invalid field: {field}")
 
-        allowed_categories = [
-            "Plumbing",
-            "Electrical",
-            "IT Support",
-            "Sanitation",
-            "Security",
-            "Maintenance",
-            "Administration",
-            "Other"
-        ]
+            value = result.get(field)
 
-        if result["category"] not in allowed_categories:
+            if not isinstance(value, str) or not value.strip():
+                raise ValueError(
+                    f"Missing or invalid field: {field}"
+                )
+
+            result[field] = value.strip()
+
+        # Validate category
+        if result["category"] not in ALLOWED_CATEGORIES:
             raise ValueError(
                 f"Invalid complaint category: {result['category']}"
             )
 
-        print("[Triage Agent] Analysis completed successfully.", flush=True)
+        # Preserve original user-provided location
+        result["location"] = location.strip()
+
+        print(
+            "[Triage Agent] NVIDIA analysis completed successfully.",
+            flush=True
+        )
 
         return {
             "success": True,
